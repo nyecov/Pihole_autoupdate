@@ -30,6 +30,10 @@ STATUS_HEALTH_SERVICES="Skipped"
 STATUS_HEALTH_DNS="Skipped"
 STATUS_BACKUP="Skipped"
 
+# Flags
+SKIP_REBOOT=false
+VERBOSE=false
+
 # ==============================================================================
 # Helper Functions
 # ==============================================================================
@@ -51,6 +55,30 @@ log_section() {
     echo "==================================================="
     echo " $1"
     echo "==================================================="
+}
+
+run_quietly() {
+    if [ "$VERBOSE" = true ]; then
+        "$@"
+    else
+        "$@" &> /dev/null
+    fi
+}
+
+show_help() {
+    echo "Usage: sudo $0 [OPTIONS]"
+    echo ""
+    echo "Options:"
+    echo "  -u, --update-only   Check for script updates and exit."
+    echo "  -v, --version       Show script version and exit."
+    echo "  --no-reboot         Skip the final system reboot."
+    echo "  --verbose           Enable detailed output."
+    echo "  -h, --help          Show this help message and exit."
+    echo ""
+    echo "Description:"
+    echo "  Automated maintenance script for Raspberry Pi."
+    echo "  Updates OS, Pi-hole, Unbound, RPi-Monitor, cleans up system,"
+    echo "  performs health checks, and emails a report."
 }
 
 check_root() {
@@ -113,7 +141,7 @@ rotate_logs() {
 
 check_connectivity() {
     log_info "Checking internet connectivity..."
-    if ! ping -c 1 8.8.8.8 &> /dev/null; then
+    if ! run_quietly ping -c 1 8.8.8.8; then
         log_error "No internet connection. Exiting."
         exit 1
     fi
@@ -137,7 +165,10 @@ self_update() {
     log_info "Checking for script updates..."
     NEW_SCRIPT=$(mktemp)
     
-    if wget -q -O "$NEW_SCRIPT" "$UPDATE_URL"; then
+    WGET_ARGS="-q"
+    if [ "$VERBOSE" = true ]; then WGET_ARGS=""; fi
+
+    if wget $WGET_ARGS -O "$NEW_SCRIPT" "$UPDATE_URL"; then
         if [ -s "$NEW_SCRIPT" ]; then
             REMOTE_VERSION=$(grep "^SCRIPT_VERSION=" "$NEW_SCRIPT" | cut -d'"' -f2)
             
@@ -222,7 +253,10 @@ update_pihole() {
 update_unbound() {
     log_section "3. Updating Unbound Root Hints"
     if [ -d "$(dirname "$UNBOUND_ROOT_HINTS")" ]; then
-        wget -q -O "$UNBOUND_ROOT_HINTS.new" https://www.internic.net/domain/named.root
+        WGET_ARGS="-q"
+        if [ "$VERBOSE" = true ]; then WGET_ARGS=""; fi
+        
+        wget $WGET_ARGS -O "$UNBOUND_ROOT_HINTS.new" https://www.internic.net/domain/named.root
         if [ -s "$UNBOUND_ROOT_HINTS.new" ]; then
             if ! cmp -s "$UNBOUND_ROOT_HINTS" "$UNBOUND_ROOT_HINTS.new"; then
                 mv "$UNBOUND_ROOT_HINTS.new" "$UNBOUND_ROOT_HINTS"
@@ -364,6 +398,11 @@ send_report() {
 }
 
 perform_reboot() {
+    if [ "$SKIP_REBOOT" = true ]; then
+        log_info "Skipping reboot as requested."
+        return
+    fi
+
     if [ -t 0 ]; then
         echo ""
         log_warn "!!! INTERACTIVE SESSION DETECTED !!!"
@@ -383,16 +422,54 @@ perform_reboot() {
     shutdown -r now
 }
 
+parse_arguments() {
+    while [[ "$#" -gt 0 ]]; do
+        case $1 in
+            -u|--update-only)
+                UPDATE_ONLY=true
+                ;;
+            -v|--version)
+                echo "RPi Maintenance Script v$SCRIPT_VERSION"
+                exit 0
+                ;;
+            --no-reboot)
+                SKIP_REBOOT=true
+                ;;
+            --verbose)
+                VERBOSE=true
+                ;;
+            -h|--help)
+                show_help
+                exit 0
+                ;;
+            *)
+                echo "Unknown parameter passed: $1"
+                show_help
+                exit 1
+                ;;
+        esac
+        shift
+    done
+}
+
 # ==============================================================================
 # Main Execution
 # ==============================================================================
 
 # 1. Initialization
+parse_arguments "$@"
+
 check_root
 check_dependencies
 trap cleanup EXIT
 check_connectivity
 self_update
+
+if [ "$UPDATE_ONLY" = true ]; then
+    log_info "Update-only mode requested. Script is up to date. Exiting."
+    exit 0
+fi
+
 manage_lockfile
 export DEBIAN_FRONTEND=noninteractive
 
