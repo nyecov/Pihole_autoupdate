@@ -13,6 +13,7 @@ LOCK_FILE="/var/run/rpi_maintenance.lock"
 # REPLACE THIS WITH YOUR RAW GITHUB URL
 UPDATE_URL="https://raw.githubusercontent.com/nyecov/Pihole_autoupdate/main/rpi_maintenance.sh"
 SCRIPT_VERSION="2025112501"
+BACKUP_DIR="/home/pihole/backups"
 
 # Status Variables
 STATUS_OS="Skipped"
@@ -23,6 +24,7 @@ STATUS_CLEANUP="Skipped"
 STATUS_SELF_UPDATE="Skipped"
 STATUS_HEALTH_SERVICES="Skipped"
 STATUS_HEALTH_DNS="Skipped"
+STATUS_BACKUP="Skipped"
 
 # Ensure root
 if [ "$EUID" -ne 0 ]; then 
@@ -38,6 +40,22 @@ if ! command -v mail &> /dev/null; then
     echo "ERROR: 'mail' command not found. Please install mailutils or bsd-mailx."
     exit 1
 fi
+
+# Log Rotation Function
+rotate_logs() {
+    # 1MB in bytes
+    MAX_SIZE=1048576
+    
+    if [ -f "$LOG_FILE" ]; then
+        FILE_SIZE=$(stat -c%s "$LOG_FILE")
+        if [ "$FILE_SIZE" -ge "$MAX_SIZE" ]; then
+            echo "Log file too large ($FILE_SIZE bytes). Rotating..."
+            mv "$LOG_FILE" "${LOG_FILE}.old"
+            touch "$LOG_FILE"
+            chmod 644 "$LOG_FILE"
+        fi
+    fi
+}
 
 # Pre-flight Checks
 check_connectivity() {
@@ -151,6 +169,7 @@ export DEBIAN_FRONTEND=noninteractive
 
 # Start Logging
 # Redirect stdout and stderr to both the main log, the session log, and the terminal
+rotate_logs
 exec > >(tee -a "$LOG_FILE" "$SESSION_LOG") 2>&1
 
 echo "==================================================="
@@ -183,6 +202,18 @@ echo ""
 echo "[2/5] Updating Pi-hole..."
 echo "-------------------------"
 if command -v pihole &> /dev/null; then
+    # Create Backup
+    echo "Creating Teleporter Backup..."
+    mkdir -p "$BACKUP_DIR"
+    if pihole -a -t "$BACKUP_DIR/pihole-backup-$(date +%Y%m%d).tar.gz"; then
+        STATUS_BACKUP="Success"
+        # Keep only last 5 backups
+        ls -t "$BACKUP_DIR"/pihole-backup-*.tar.gz | tail -n +6 | xargs -r rm --
+    else
+        STATUS_BACKUP="Failed"
+        echo "WARNING: Pi-hole backup failed."
+    fi
+
     if pihole -up; then
         echo "Updating Gravity (Blocklists)..."
         if pihole -g; then
@@ -322,6 +353,7 @@ echo "###################################################"
 echo "OS Update:      $STATUS_OS"
 echo "  Details:      ${OS_CHANGES:-No changes detected}"
 echo "Pi-hole:        $STATUS_PIHOLE"
+echo "  Backup:       $STATUS_BACKUP"
 echo "Unbound:        $STATUS_UNBOUND"
 echo "RPi-Monitor:    $STATUS_RPIMONITOR"
 echo "Cleanup:        $STATUS_CLEANUP"
