@@ -4,7 +4,9 @@
 # Targets: Raspbian, Pi-hole, Unbound, RPi-Monitor
 # Actions: Update, Upgrade, Cleanup, Report, Reboot
 
+# ==============================================================================
 # Configuration
+# ==============================================================================
 LOG_FILE="/var/log/rpi_maintenance.log"
 EMAIL_TO="nyecov@gmail.com"
 UNBOUND_ROOT_HINTS="/var/lib/unbound/root.hints"
@@ -12,10 +14,12 @@ SESSION_LOG=$(mktemp)
 LOCK_FILE="/var/run/rpi_maintenance.lock"
 # REPLACE THIS WITH YOUR RAW GITHUB URL
 UPDATE_URL="https://raw.githubusercontent.com/nyecov/Pihole_autoupdate/main/rpi_maintenance.sh"
-SCRIPT_VERSION="2025112502"
+SCRIPT_VERSION="2025112504"
 BACKUP_DIR="/home/pihole/backups"
 
-# Status Variables
+# ==============================================================================
+# Global Status Variables
+# ==============================================================================
 STATUS_OS="Skipped"
 STATUS_PIHOLE="Skipped"
 STATUS_UNBOUND="Skipped"
@@ -26,30 +30,76 @@ STATUS_HEALTH_SERVICES="Skipped"
 STATUS_HEALTH_DNS="Skipped"
 STATUS_BACKUP="Skipped"
 
-# Ensure root
-if [ "$EUID" -ne 0 ]; then 
-    echo "Please run as root (sudo)"
-    exit 1
-fi
+# ==============================================================================
+# Helper Functions
+# ==============================================================================
 
-# Set PATH to ensure we find all commands
-export PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+log_info() {
+    echo "[INFO] $1"
+}
 
-# Check dependencies
-if ! command -v mail &> /dev/null; then
-    echo "ERROR: 'mail' command not found. Please install mailutils or bsd-mailx."
-    exit 1
-fi
+log_warn() {
+    echo "[WARN] $1"
+}
 
-# Log Rotation Function
-rotate_logs() {
-    # 1MB in bytes
-    MAX_SIZE=1048576
+log_error() {
+    echo "[ERROR] $1" >&2
+}
+
+log_section() {
+    echo ""
+    echo "==================================================="
+    echo " $1"
+    echo "==================================================="
+}
+
+check_root() {
+    if [ "$EUID" -ne 0 ]; then 
+        log_error "Please run as root (sudo)"
+        exit 1
+    fi
+}
+
+check_dependencies() {
+    # Set PATH to ensure we find all commands
+    export PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
     
+    if ! command -v mail &> /dev/null; then
+        log_error "'mail' command not found. Please install mailutils or bsd-mailx."
+        exit 1
+    fi
+}
+
+cleanup() {
+    rm -f "$SESSION_LOG"
+    # Only remove lockfile if we own it
+    if [ -f "$LOCK_FILE" ]; then
+        if [ "$(cat "$LOCK_FILE")" == "$$" ]; then
+            rm -f "$LOCK_FILE"
+        fi
+    fi
+}
+
+manage_lockfile() {
+    if [ -f "$LOCK_FILE" ]; then
+        PID=$(cat "$LOCK_FILE")
+        if ps -p "$PID" > /dev/null 2>&1; then
+            log_error "Script is already running (PID: $PID). Exiting."
+            exit 1
+        else
+            log_warn "Found stale lockfile. Removing..."
+            rm -f "$LOCK_FILE"
+        fi
+    fi
+    echo $$ > "$LOCK_FILE"
+}
+
+rotate_logs() {
+    MAX_SIZE=1048576 # 1MB
     if [ -f "$LOG_FILE" ]; then
         FILE_SIZE=$(stat -c%s "$LOG_FILE")
         if [ "$FILE_SIZE" -ge "$MAX_SIZE" ]; then
-            echo "Log file too large ($FILE_SIZE bytes). Rotating..."
+            log_info "Log file too large ($FILE_SIZE bytes). Rotating..."
             mv "$LOG_FILE" "${LOG_FILE}.old"
             touch "$LOG_FILE"
             chmod 644 "$LOG_FILE"
@@ -57,335 +107,316 @@ rotate_logs() {
     fi
 }
 
-# Pre-flight Checks
+# ==============================================================================
+# Feature Functions
+# ==============================================================================
+
 check_connectivity() {
-    echo "Checking internet connectivity..."
+    log_info "Checking internet connectivity..."
     if ! ping -c 1 8.8.8.8 &> /dev/null; then
-        echo "ERROR: No internet connection. Exiting."
+        log_error "No internet connection. Exiting."
         exit 1
     fi
 }
 
 check_disk_space() {
-    echo "Checking disk space..."
-    # Check root partition, get available space in KB
+    log_info "Checking disk space..."
     AVAILABLE_KB=$(df / | tail -1 | awk '{print $4}')
-    # 500MB in KB
-    MIN_KB=512000
+    MIN_KB=512000 # 500MB
     
     if [ "$AVAILABLE_KB" -lt "$MIN_KB" ]; then
-        echo "ERROR: Insufficient disk space. Available: $((AVAILABLE_KB/1024))MB, Required: 500MB."
+        log_error "Insufficient disk space. Available: $((AVAILABLE_KB/1024))MB, Required: 500MB."
         exit 1
     fi
 }
 
-# Self-Update Function
 self_update() {
-    echo "Checking for script updates..."
-    # Create a temp file for the new script
+    # Only run if UPDATE_URL is configured
+    if [[ "$UPDATE_URL" == *"USERNAME/REPO"* ]]; then return; fi
+
+    log_info "Checking for script updates..."
     NEW_SCRIPT=$(mktemp)
     
-    # Download the script
     if wget -q -O "$NEW_SCRIPT" "$UPDATE_URL"; then
-        # Check if download is valid (not empty)
         if [ -s "$NEW_SCRIPT" ]; then
-            # Extract remote version
             REMOTE_VERSION=$(grep "^SCRIPT_VERSION=" "$NEW_SCRIPT" | cut -d'"' -f2)
             
-            # Check if we found a version
             if [ -z "$REMOTE_VERSION" ]; then
-                echo "Warning: No version found in remote script. Skipping update."
+                log_warn "No version found in remote script. Skipping update."
                 STATUS_SELF_UPDATE="Failed (No Version Tag)"
                 rm "$NEW_SCRIPT"
                 return
             fi
             
-            echo "Local Version:  $SCRIPT_VERSION"
-            echo "Remote Version: $REMOTE_VERSION"
+            log_info "Local Version:  $SCRIPT_VERSION"
+            log_info "Remote Version: $REMOTE_VERSION"
             
-            # Compare versions
             if [ "$REMOTE_VERSION" -gt "$SCRIPT_VERSION" ]; then
-                echo "New version found! Installing..."
-                # Preserve permissions
+                log_info "New version found! Installing..."
                 chmod --reference="$0" "$NEW_SCRIPT"
                 mv "$NEW_SCRIPT" "$0"
-                
-                echo "Restarting script..."
+                log_info "Restarting script..."
                 STATUS_SELF_UPDATE="Updated ($SCRIPT_VERSION -> $REMOTE_VERSION) & Restarted"
-                # Exec the new script with the same arguments
                 exec "$0" "$@"
             else
-                echo "Script is up to date."
+                log_info "Script is up to date."
                 STATUS_SELF_UPDATE="Up to Date ($SCRIPT_VERSION)"
                 rm "$NEW_SCRIPT"
             fi
         else
-            echo "Warning: Downloaded update file is empty."
+            log_warn "Downloaded update file is empty."
             STATUS_SELF_UPDATE="Failed (Empty Download)"
             rm "$NEW_SCRIPT"
         fi
     else
-        echo "Warning: Failed to check for updates (wget failed)."
+        log_warn "Failed to check for updates (wget failed)."
         STATUS_SELF_UPDATE="Failed (Connection Error)"
         rm -f "$NEW_SCRIPT"
     fi
 }
 
-# Run checks
-check_connectivity
-# Run self-update before locking
-# We run this first so we don't lock the old version while trying to update
-# Only run if UPDATE_URL is not the default placeholder
-if [[ "$UPDATE_URL" != *"USERNAME/REPO"* ]]; then
-    self_update
-fi
-
-# Lockfile mechanism
-if [ -f "$LOCK_FILE" ]; then
-    # Check if process is actually running
-    PID=$(cat "$LOCK_FILE")
-    if ps -p "$PID" > /dev/null 2>&1; then
-        echo "Script is already running (PID: $PID). Exiting."
-        exit 1
+update_os() {
+    log_section "1. Updating OS Packages"
+    if apt-get update; then
+        OS_CHANGES=$(apt-get dist-upgrade -s | grep -P "^\d+ upgraded, \d+ newly installed")
+        if apt-get dist-upgrade -y; then
+            STATUS_OS="Success"
+        else
+            STATUS_OS="Failed (Upgrade)"
+        fi
     else
-        echo "Found stale lockfile. Removing..."
-        rm -f "$LOCK_FILE"
+        STATUS_OS="Failed (Update)"
     fi
-fi
-
-# Create lockfile
-echo $$ > "$LOCK_FILE"
-
-# Cleanup Trap
-# Ensures lockfile and session log are removed on exit or interruption
-cleanup() {
-    rm -f "$SESSION_LOG"
-    rm -f "$LOCK_FILE"
 }
-trap cleanup EXIT
 
-# Set non-interactive frontend for apt
+update_pihole() {
+    log_section "2. Updating Pi-hole"
+    if command -v pihole &> /dev/null; then
+        # Backup
+        log_info "Creating Teleporter Backup..."
+        mkdir -p "$BACKUP_DIR"
+        if pihole -a -t "$BACKUP_DIR/pihole-backup-$(date +%Y%m%d).tar.gz"; then
+            STATUS_BACKUP="Success"
+            ls -t "$BACKUP_DIR"/pihole-backup-*.tar.gz | tail -n +6 | xargs -r rm --
+        else
+            STATUS_BACKUP="Failed"
+            log_warn "Pi-hole backup failed."
+        fi
+
+        # Update
+        if pihole -up; then
+            log_info "Updating Gravity (Blocklists)..."
+            if pihole -g; then
+                STATUS_PIHOLE="Success (Core & Gravity)"
+            else
+                STATUS_PIHOLE="Success (Core) / Failed (Gravity)"
+            fi
+        else
+            STATUS_PIHOLE="Failed"
+        fi
+    else
+        STATUS_PIHOLE="Not Installed"
+    fi
+}
+
+update_unbound() {
+    log_section "3. Updating Unbound Root Hints"
+    if [ -d "$(dirname "$UNBOUND_ROOT_HINTS")" ]; then
+        wget -q -O "$UNBOUND_ROOT_HINTS.new" https://www.internic.net/domain/named.root
+        if [ -s "$UNBOUND_ROOT_HINTS.new" ]; then
+            if ! cmp -s "$UNBOUND_ROOT_HINTS" "$UNBOUND_ROOT_HINTS.new"; then
+                mv "$UNBOUND_ROOT_HINTS.new" "$UNBOUND_ROOT_HINTS"
+                log_info "Root hints updated."
+                if systemctl restart unbound; then
+                    STATUS_UNBOUND="Updated & Restarted"
+                else
+                    STATUS_UNBOUND="Updated but Restart Failed"
+                fi
+            else
+                rm "$UNBOUND_ROOT_HINTS.new"
+                log_info "Root hints already up to date."
+                STATUS_UNBOUND="Up to Date"
+            fi
+        else
+            log_error "Downloaded root hints empty."
+            rm "$UNBOUND_ROOT_HINTS.new"
+            STATUS_UNBOUND="Failed (Empty Download)"
+        fi
+    else
+        log_warn "Unbound directory not found, skipping."
+        STATUS_UNBOUND="Not Installed"
+    fi
+}
+
+update_rpimonitor() {
+    log_section "4. Updating RPi-Monitor"
+    if dpkg -s rpimonitor &> /dev/null; then
+        if command -v rpimonitor &> /dev/null; then
+            if rpimonitor -u; then
+                STATUS_RPIMONITOR="Success (Command)"
+            else
+                STATUS_RPIMONITOR="Failed (Command)"
+            fi
+        elif [ -x "/usr/share/rpimonitor/scripts/update_packages_status.pl" ]; then
+            if /usr/share/rpimonitor/scripts/update_packages_status.pl; then
+                STATUS_RPIMONITOR="Success (Script)"
+            else
+                STATUS_RPIMONITOR="Failed (Script)"
+            fi
+        else
+            STATUS_RPIMONITOR="Installed (Update Cmd Missing)"
+            log_warn "RPi-Monitor installed but update command not found."
+        fi
+    else
+        STATUS_RPIMONITOR="Not Installed"
+    fi
+}
+
+system_cleanup() {
+    log_section "5. Cleaning up"
+    CLEANUP_SUCCESS=true
+    
+    CLEANUP_OUTPUT=$(apt-get autoremove --purge -y 2>&1)
+    if [ $? -ne 0 ]; then CLEANUP_SUCCESS=false; fi
+    
+    apt-get clean
+    
+    log_info "Vacuuming systemd journal (keeping 7 days)..."
+    journalctl --vacuum-time=7d
+    if [ $? -ne 0 ]; then CLEANUP_SUCCESS=false; fi
+
+    if [ "$CLEANUP_SUCCESS" = true ]; then
+        STATUS_CLEANUP="Success"
+        REMOVED_COUNT=$(echo "$CLEANUP_OUTPUT" | grep -c "Removing")
+        CLEANUP_CHANGES="$REMOVED_COUNT packages removed"
+    else
+        STATUS_CLEANUP="Failed"
+    fi
+}
+
+health_checks() {
+    log_section "6. Post-Update Health Checks"
+    
+    # Service Checks
+    FAILED_SERVICES=""
+    for SERVICE in pihole-FTL unbound rpimonitor; do
+        if systemctl is-active --quiet "$SERVICE"; then
+            log_info "Service '$SERVICE': OK"
+        else
+            log_error "Service '$SERVICE': FAILED"
+            FAILED_SERVICES="$FAILED_SERVICES $SERVICE"
+        fi
+    done
+
+    if [ -z "$FAILED_SERVICES" ]; then
+        STATUS_HEALTH_SERVICES="All OK"
+    else
+        STATUS_HEALTH_SERVICES="Failed: $FAILED_SERVICES"
+    fi
+
+    # DNS Check
+    if command -v dig &> /dev/null; then
+        if dig @127.0.0.1 google.com +short +time=2 > /dev/null; then
+            STATUS_HEALTH_DNS="OK (Resolved via Localhost)"
+        else
+            STATUS_HEALTH_DNS="Failed (Dig Resolution Error)"
+        fi
+    elif command -v nslookup &> /dev/null; then
+        if nslookup google.com 127.0.0.1 > /dev/null; then
+            STATUS_HEALTH_DNS="OK (Resolved via Localhost)"
+        else
+            STATUS_HEALTH_DNS="Failed (Nslookup Resolution Error)"
+        fi
+    else
+        STATUS_HEALTH_DNS="Skipped (No DNS tools found)"
+    fi
+    log_info "DNS Check: $STATUS_HEALTH_DNS"
+}
+
+send_report() {
+    log_section "Generating Report"
+    
+    # Generate Summary
+    {
+        echo ""
+        echo "###################################################"
+        echo "                  SESSION SUMMARY                  "
+        echo "###################################################"
+        echo "OS Update:      $STATUS_OS"
+        echo "  Details:      ${OS_CHANGES:-No changes detected}"
+        echo "Pi-hole:        $STATUS_PIHOLE"
+        echo "  Backup:       $STATUS_BACKUP"
+        echo "Unbound:        $STATUS_UNBOUND"
+        echo "RPi-Monitor:    $STATUS_RPIMONITOR"
+        echo "Cleanup:        $STATUS_CLEANUP"
+        echo "  Details:      ${CLEANUP_CHANGES:-No cleanup needed}"
+        echo "---------------------------------------------------"
+        echo "Health Checks:"
+        echo "  Services:     $STATUS_HEALTH_SERVICES"
+        echo "  DNS:          $STATUS_HEALTH_DNS"
+        echo "###################################################"
+    } | tee -a "$SESSION_LOG"
+
+    # Send Email
+    SUBJECT="RPi Maintenance Report - $(date '+%Y-%m-%d') - $STATUS_OS"
+    cat "$SESSION_LOG" | mail -s "$SUBJECT" "$EMAIL_TO"
+    log_info "Email report sent to $EMAIL_TO"
+}
+
+perform_reboot() {
+    if [ -t 0 ]; then
+        echo ""
+        log_warn "!!! INTERACTIVE SESSION DETECTED !!!"
+        read -t 10 -n 1 -s -r -p "System will reboot in 10 seconds. Press ANY KEY to CANCEL reboot..."
+        if [ $? -eq 0 ]; then
+            echo -e "\n\nReboot canceled by user."
+            log_info "Exiting."
+            exit 0
+        fi
+        echo -e "\n\nTimeout reached. Rebooting..."
+    else
+        log_info "Running non-interactively. Auto-rebooting in 5 seconds..."
+        sleep 5
+    fi
+
+    sync
+    shutdown -r now
+}
+
+# ==============================================================================
+# Main Execution
+# ==============================================================================
+
+# 1. Initialization
+check_root
+check_dependencies
+trap cleanup EXIT
+check_connectivity
+self_update
+manage_lockfile
 export DEBIAN_FRONTEND=noninteractive
 
-# Start Logging
-# Redirect stdout and stderr to both the main log, the session log, and the terminal
+# 2. Start Logging
 rotate_logs
 exec > >(tee -a "$LOG_FILE" "$SESSION_LOG") 2>&1
 
-echo "==================================================="
-echo " RPi Maintenance Started: $(date)"
-echo "==================================================="
+log_section "RPi Maintenance Started: $(date)"
 
-# Run Disk Space Check (after logging starts so it's recorded)
+# 3. Pre-flight
 check_disk_space
 
-# 1. Update OS (Raspbian)
-echo ""
-echo "[1/5] Updating OS Packages..."
-echo "-----------------------------"
-if apt-get update; then
-    # Capture the upgrade summary line (e.g., "0 upgraded, 0 newly installed...")
-    # We run a dry-run first to get the stats cleanly, then the actual upgrade
-    OS_CHANGES=$(apt-get dist-upgrade -s | grep -P "^\d+ upgraded, \d+ newly installed")
-    
-    if apt-get dist-upgrade -y; then
-        STATUS_OS="Success"
-    else
-        STATUS_OS="Failed (Upgrade)"
-    fi
-else
-    STATUS_OS="Failed (Update)"
-fi
-
-# 2. Update Pi-hole
-echo ""
-echo "[2/5] Updating Pi-hole..."
-echo "-------------------------"
-if command -v pihole &> /dev/null; then
-    # Create Backup
-    echo "Creating Teleporter Backup..."
-    mkdir -p "$BACKUP_DIR"
-    if pihole -a -t "$BACKUP_DIR/pihole-backup-$(date +%Y%m%d).tar.gz"; then
-        STATUS_BACKUP="Success"
-        # Keep only last 5 backups
-        ls -t "$BACKUP_DIR"/pihole-backup-*.tar.gz | tail -n +6 | xargs -r rm --
-    else
-        STATUS_BACKUP="Failed"
-        echo "WARNING: Pi-hole backup failed."
-    fi
-
-    if pihole -up; then
-        echo "Updating Gravity (Blocklists)..."
-        if pihole -g; then
-            STATUS_PIHOLE="Success (Core & Gravity)"
-        else
-            STATUS_PIHOLE="Success (Core) / Failed (Gravity)"
-        fi
-    else
-        STATUS_PIHOLE="Failed"
-    fi
-else
-    STATUS_PIHOLE="Not Installed"
-fi
-
-# 3. Update Unbound Root Hints
-echo ""
-echo "[3/5] Updating Unbound Root Hints..."
-echo "------------------------------------"
-if [ -d "$(dirname "$UNBOUND_ROOT_HINTS")" ]; then
-    wget -q -O "$UNBOUND_ROOT_HINTS.new" https://www.internic.net/domain/named.root
-    if [ -s "$UNBOUND_ROOT_HINTS.new" ]; then
-        if ! cmp -s "$UNBOUND_ROOT_HINTS" "$UNBOUND_ROOT_HINTS.new"; then
-            mv "$UNBOUND_ROOT_HINTS.new" "$UNBOUND_ROOT_HINTS"
-            echo "Root hints updated."
-            if systemctl restart unbound; then
-                STATUS_UNBOUND="Updated & Restarted"
-            else
-                STATUS_UNBOUND="Updated but Restart Failed"
-            fi
-        else
-            rm "$UNBOUND_ROOT_HINTS.new"
-            echo "Root hints already up to date."
-            STATUS_UNBOUND="Up to Date"
-        fi
-    else
-        echo "Error: Downloaded root hints empty."
-        rm "$UNBOUND_ROOT_HINTS.new"
-        STATUS_UNBOUND="Failed (Empty Download)"
-    fi
-else
-    echo "Unbound directory not found, skipping."
-    STATUS_UNBOUND="Not Installed"
-fi
-
-# 4. Update RPi-Monitor
-echo ""
-echo "[4/5] Updating RPi-Monitor..."
-echo "-----------------------------"
-# Check if installed via dpkg
-if dpkg -s rpimonitor &> /dev/null; then
-    # Try standard command
-    if command -v rpimonitor &> /dev/null; then
-        if rpimonitor -u; then
-            STATUS_RPIMONITOR="Success (Command)"
-        else
-            STATUS_RPIMONITOR="Failed (Command)"
-        fi
-    # Try direct script path (common in some installs)
-    elif [ -x "/usr/share/rpimonitor/scripts/update_packages_status.pl" ]; then
-        if /usr/share/rpimonitor/scripts/update_packages_status.pl; then
-            STATUS_RPIMONITOR="Success (Script)"
-        else
-            STATUS_RPIMONITOR="Failed (Script)"
-        fi
-    else
-        STATUS_RPIMONITOR="Installed (Update Cmd Missing)"
-        echo "WARNING: RPi-Monitor installed but update command not found."
-    fi
-else
-    STATUS_RPIMONITOR="Not Installed"
-fi
+# 4. Updates
+update_os
+update_pihole
+update_unbound
+update_rpimonitor
 
 # 5. Cleanup
-echo ""
-echo "[5/5] Cleaning up..."
-echo "--------------------"
-# Capture autoremove stats
-CLEANUP_CHANGES=$(apt-get autoremove --purge -s | grep -P "^\d+ upgraded, \d+ newly installed")
+system_cleanup
 
-if apt-get autoremove --purge -y && apt-get clean; then
-    STATUS_CLEANUP="Success"
-else
-    STATUS_CLEANUP="Failed"
-fi
+# 6. Verification
+health_checks
 
-# 6. Health Checks
-echo ""
-echo "[6/6] Running Post-Update Health Checks..."
-echo "----------------------------------------"
-
-# Service Checks
-FAILED_SERVICES=""
-for SERVICE in pihole-FTL unbound rpimonitor; do
-    if systemctl is-active --quiet "$SERVICE"; then
-        echo "Service '$SERVICE': OK"
-    else
-        echo "Service '$SERVICE': FAILED"
-        FAILED_SERVICES="$FAILED_SERVICES $SERVICE"
-    fi
-done
-
-if [ -z "$FAILED_SERVICES" ]; then
-    STATUS_HEALTH_SERVICES="All OK"
-else
-    STATUS_HEALTH_SERVICES="Failed: $FAILED_SERVICES"
-fi
-
-# DNS Check
-# Try to resolve google.com using localhost (127.0.0.1)
-if command -v dig &> /dev/null; then
-    if dig @127.0.0.1 google.com +short +time=2 > /dev/null; then
-        STATUS_HEALTH_DNS="OK (Resolved via Localhost)"
-    else
-        STATUS_HEALTH_DNS="Failed (Dig Resolution Error)"
-    fi
-elif command -v nslookup &> /dev/null; then
-    if nslookup google.com 127.0.0.1 > /dev/null; then
-        STATUS_HEALTH_DNS="OK (Resolved via Localhost)"
-    else
-        STATUS_HEALTH_DNS="Failed (Nslookup Resolution Error)"
-    fi
-else
-    STATUS_HEALTH_DNS="Skipped (No DNS tools found)"
-fi
-echo "DNS Check: $STATUS_HEALTH_DNS"
-
-echo ""
-echo "==================================================="
-echo " Maintenance Complete: $(date)"
-echo "==================================================="
-
-# Generate Summary Report
-echo ""
-echo "###################################################"
-echo "                  SESSION SUMMARY                  "
-echo "###################################################"
-echo "OS Update:      $STATUS_OS"
-echo "  Details:      ${OS_CHANGES:-No changes detected}"
-echo "Pi-hole:        $STATUS_PIHOLE"
-echo "  Backup:       $STATUS_BACKUP"
-echo "Unbound:        $STATUS_UNBOUND"
-echo "RPi-Monitor:    $STATUS_RPIMONITOR"
-echo "Cleanup:        $STATUS_CLEANUP"
-echo "  Details:      ${CLEANUP_CHANGES:-No cleanup needed}"
-echo "---------------------------------------------------"
-echo "Health Checks:"
-echo "  Services:     $STATUS_HEALTH_SERVICES"
-echo "  DNS:          $STATUS_HEALTH_DNS"
-echo "###################################################"
-
-# Send Email Report (Session Log Only)
-SUBJECT="RPi Maintenance Report - $(date '+%Y-%m-%d') - $STATUS_OS"
-cat "$SESSION_LOG" | mail -s "$SUBJECT" "$EMAIL_TO"
-
-echo "Email report sent to $EMAIL_TO"
-
-# Interactive Reboot Check
-if [ -t 0 ]; then
-    echo ""
-    echo "!!! INTERACTIVE SESSION DETECTED !!!"
-    read -t 10 -n 1 -s -r -p "System will reboot in 10 seconds. Press ANY KEY to CANCEL reboot..."
-    if [ $? -eq 0 ]; then
-        echo -e "\n\nReboot canceled by user."
-        echo "Exiting."
-        exit 0
-    fi
-    echo -e "\n\nTimeout reached. Rebooting..."
-else
-    echo "Running non-interactively. Auto-rebooting in 5 seconds..."
-    sleep 5
-fi
-
-# Safe Reboot
-sync
-shutdown -r now
+# 7. Reporting & Exit
+send_report
+perform_reboot
