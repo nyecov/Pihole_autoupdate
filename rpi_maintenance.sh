@@ -12,6 +12,7 @@ SESSION_LOG=$(mktemp)
 LOCK_FILE="/var/run/rpi_maintenance.lock"
 # REPLACE THIS WITH YOUR RAW GITHUB URL
 UPDATE_URL="https://raw.githubusercontent.com/nyecov/Pihole_autoupdate/main/rpi_maintenance.sh"
+SCRIPT_VERSION="2025112501"
 
 # Status Variables
 STATUS_OS="Skipped"
@@ -70,24 +71,34 @@ self_update() {
     if wget -q -O "$NEW_SCRIPT" "$UPDATE_URL"; then
         # Check if download is valid (not empty)
         if [ -s "$NEW_SCRIPT" ]; then
-            # Compare with current script
-            # We filter out the UPDATE_URL line to avoid loops if you change the URL in the repo
-            CURRENT_HASH=$(grep -v "UPDATE_URL=" "$0" | md5sum | awk '{print $1}')
-            NEW_HASH=$(grep -v "UPDATE_URL=" "$NEW_SCRIPT" | md5sum | awk '{print $1}')
+            # Extract remote version
+            REMOTE_VERSION=$(grep "^SCRIPT_VERSION=" "$NEW_SCRIPT" | cut -d'"' -f2)
             
-            if [ "$CURRENT_HASH" != "$NEW_HASH" ]; then
-                echo "Update found! Installing..."
+            # Check if we found a version
+            if [ -z "$REMOTE_VERSION" ]; then
+                echo "Warning: No version found in remote script. Skipping update."
+                STATUS_SELF_UPDATE="Failed (No Version Tag)"
+                rm "$NEW_SCRIPT"
+                return
+            fi
+            
+            echo "Local Version:  $SCRIPT_VERSION"
+            echo "Remote Version: $REMOTE_VERSION"
+            
+            # Compare versions
+            if [ "$REMOTE_VERSION" -gt "$SCRIPT_VERSION" ]; then
+                echo "New version found! Installing..."
                 # Preserve permissions
                 chmod --reference="$0" "$NEW_SCRIPT"
                 mv "$NEW_SCRIPT" "$0"
                 
                 echo "Restarting script..."
-                STATUS_SELF_UPDATE="Updated & Restarted"
+                STATUS_SELF_UPDATE="Updated ($SCRIPT_VERSION -> $REMOTE_VERSION) & Restarted"
                 # Exec the new script with the same arguments
                 exec "$0" "$@"
             else
                 echo "Script is up to date."
-                STATUS_SELF_UPDATE="Up to Date"
+                STATUS_SELF_UPDATE="Up to Date ($SCRIPT_VERSION)"
                 rm "$NEW_SCRIPT"
             fi
         else
