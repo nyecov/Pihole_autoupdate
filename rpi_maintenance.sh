@@ -14,7 +14,7 @@ SESSION_LOG=$(mktemp)
 LOCK_FILE="/var/run/rpi_maintenance.lock"
 # REPLACE THIS WITH YOUR RAW GITHUB URL
 UPDATE_URL="https://raw.githubusercontent.com/nyecov/Pihole_autoupdate/main/rpi_maintenance.sh"
-SCRIPT_VERSION="2025112504"
+SCRIPT_VERSION="2025112505"
 BACKUP_DIR="/home/pihole/backups"
 
 # ==============================================================================
