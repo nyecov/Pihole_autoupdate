@@ -20,6 +20,8 @@ STATUS_UNBOUND="Skipped"
 STATUS_RPIMONITOR="Skipped"
 STATUS_CLEANUP="Skipped"
 STATUS_SELF_UPDATE="Skipped"
+STATUS_HEALTH_SERVICES="Skipped"
+STATUS_HEALTH_DNS="Skipped"
 
 # Ensure root
 if [ "$EUID" -ne 0 ]; then 
@@ -35,6 +37,28 @@ if ! command -v mail &> /dev/null; then
     echo "ERROR: 'mail' command not found. Please install mailutils or bsd-mailx."
     exit 1
 fi
+
+# Pre-flight Checks
+check_connectivity() {
+    echo "Checking internet connectivity..."
+    if ! ping -c 1 8.8.8.8 &> /dev/null; then
+        echo "ERROR: No internet connection. Exiting."
+        exit 1
+    fi
+}
+
+check_disk_space() {
+    echo "Checking disk space..."
+    # Check root partition, get available space in KB
+    AVAILABLE_KB=$(df / | tail -1 | awk '{print $4}')
+    # 500MB in KB
+    MIN_KB=512000
+    
+    if [ "$AVAILABLE_KB" -lt "$MIN_KB" ]; then
+        echo "ERROR: Insufficient disk space. Available: $((AVAILABLE_KB/1024))MB, Required: 500MB."
+        exit 1
+    fi
+}
 
 # Self-Update Function
 self_update() {
@@ -78,6 +102,8 @@ self_update() {
     fi
 }
 
+# Run checks
+check_connectivity
 # Run self-update before locking
 # We run this first so we don't lock the old version while trying to update
 # Only run if UPDATE_URL is not the default placeholder
@@ -120,6 +146,9 @@ echo "==================================================="
 echo " RPi Maintenance Started: $(date)"
 echo "==================================================="
 
+# Run Disk Space Check (after logging starts so it's recorded)
+check_disk_space
+
 # 1. Update OS (Raspbian)
 echo ""
 echo "[1/5] Updating OS Packages..."
@@ -144,7 +173,12 @@ echo "[2/5] Updating Pi-hole..."
 echo "-------------------------"
 if command -v pihole &> /dev/null; then
     if pihole -up; then
-        STATUS_PIHOLE="Success"
+        echo "Updating Gravity (Blocklists)..."
+        if pihole -g; then
+            STATUS_PIHOLE="Success (Core & Gravity)"
+        else
+            STATUS_PIHOLE="Success (Core) / Failed (Gravity)"
+        fi
     else
         STATUS_PIHOLE="Failed"
     fi
@@ -223,6 +257,47 @@ else
     STATUS_CLEANUP="Failed"
 fi
 
+# 6. Health Checks
+echo ""
+echo "[6/6] Running Post-Update Health Checks..."
+echo "----------------------------------------"
+
+# Service Checks
+FAILED_SERVICES=""
+for SERVICE in pihole-FTL unbound rpimonitor; do
+    if systemctl is-active --quiet "$SERVICE"; then
+        echo "Service '$SERVICE': OK"
+    else
+        echo "Service '$SERVICE': FAILED"
+        FAILED_SERVICES="$FAILED_SERVICES $SERVICE"
+    fi
+done
+
+if [ -z "$FAILED_SERVICES" ]; then
+    STATUS_HEALTH_SERVICES="All OK"
+else
+    STATUS_HEALTH_SERVICES="Failed: $FAILED_SERVICES"
+fi
+
+# DNS Check
+# Try to resolve google.com using localhost (127.0.0.1)
+if command -v dig &> /dev/null; then
+    if dig @127.0.0.1 google.com +short +time=2 > /dev/null; then
+        STATUS_HEALTH_DNS="OK (Resolved via Localhost)"
+    else
+        STATUS_HEALTH_DNS="Failed (Dig Resolution Error)"
+    fi
+elif command -v nslookup &> /dev/null; then
+    if nslookup google.com 127.0.0.1 > /dev/null; then
+        STATUS_HEALTH_DNS="OK (Resolved via Localhost)"
+    else
+        STATUS_HEALTH_DNS="Failed (Nslookup Resolution Error)"
+    fi
+else
+    STATUS_HEALTH_DNS="Skipped (No DNS tools found)"
+fi
+echo "DNS Check: $STATUS_HEALTH_DNS"
+
 echo ""
 echo "==================================================="
 echo " Maintenance Complete: $(date)"
@@ -240,6 +315,10 @@ echo "Unbound:        $STATUS_UNBOUND"
 echo "RPi-Monitor:    $STATUS_RPIMONITOR"
 echo "Cleanup:        $STATUS_CLEANUP"
 echo "  Details:      ${CLEANUP_CHANGES:-No cleanup needed}"
+echo "---------------------------------------------------"
+echo "Health Checks:"
+echo "  Services:     $STATUS_HEALTH_SERVICES"
+echo "  DNS:          $STATUS_HEALTH_DNS"
 echo "###################################################"
 
 # Send Email Report (Session Log Only)
