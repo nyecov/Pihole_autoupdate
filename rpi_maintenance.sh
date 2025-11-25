@@ -11,7 +11,7 @@ UNBOUND_ROOT_HINTS="/var/lib/unbound/root.hints"
 SESSION_LOG=$(mktemp)
 LOCK_FILE="/var/run/rpi_maintenance.lock"
 # REPLACE THIS WITH YOUR RAW GITHUB URL
-UPDATE_URL="https://raw.githubusercontent.com/USERNAME/REPO/main/rpi_maintenance.sh"
+UPDATE_URL="https://raw.githubusercontent.com/nyecov/Pihole_autoupdate/main/rpi_maintenance.sh"
 
 # Status Variables
 STATUS_OS="Skipped"
